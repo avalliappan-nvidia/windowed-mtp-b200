@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use this software or its results, please cite both the software and the paper."
+title: "Windowed-MTP: B200 reproduction package"
+type: software
+authors:
+  - family-names: Valliappan
+    given-names: Alagappan
+    affiliation: NVIDIA
+    email: avalliappan@nvidia.com
+repository-code: "https://github.com/avalliappan-nvidia/windowed-mtp-b200"
+license: Apache-2.0
+version: "1.0.0"
+date-released: "2026-07-23"
+keywords:
+  - speculative decoding
+  - multi-token prediction
+  - long context
+  - KV cache
+  - LLM inference
+  - SGLang
+preferred-citation:
+  type: article
+  title: "Windowed-MTP: Removing the Full-Context Draft-KV Tax at Million-Token Context"
+  authors:
+    - family-names: Valliappan
+      given-names: Alagappan
+      affiliation: NVIDIA
+  year: 2026
+  # doi: 10.5281/zenodo.XXXXXXX   # fill in after minting the Zenodo DOI
+  url: https://arxiv.org/abs/2607.21535

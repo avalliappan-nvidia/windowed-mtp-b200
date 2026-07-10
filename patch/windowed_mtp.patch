@@ -1,0 +1,759 @@
+--- a/srt/layers/attention/flashinfer_backend.py
++++ b/srt/layers/attention/flashinfer_backend.py
+@@ -1575,6 +1575,8 @@
+             next_power_of_2(self.speculative_num_steps),
+             next_power_of_2(bs),
+             self.page_size,
++            get_int_env_var("RK_MTP_WINDOW", 0),  # [Windowed-MTP] draft KV window (0=off)
++            get_int_env_var("RK_MTP_SINK", 0),  # [Windowed-MTP] StreamingLLM sink tokens (0=window-only)
+         )
+ 
+         assert forward_batch.spec_info is not None
+--- a/srt/layers/attention/triton_backend.py
++++ b/srt/layers/attention/triton_backend.py
+@@ -109,6 +109,10 @@
+         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
++        # [Windowed-MTP ring] cache ring cfg for graph-safe windowed+ring draft-extend read
++        from sglang.srt.speculative.ring_draft import resolve_ring_config
++
++        self.ring_cfg = resolve_ring_config(self.num_draft_tokens or 0)
+         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+         self.num_head = (
+             model_runner.model_config.num_attention_heads // get_attention_tp_size()
+@@ -700,17 +704,34 @@
+                 device=self.device,
+             )
+             kv_indptr = self.kv_indptr[: bs + 1]
+-            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+             kv_indices = self.cuda_graph_kv_indices
+-            create_flashinfer_kv_indices_triton[(bs,)](
+-                self.req_to_token,
+-                req_pool_indices,
+-                seq_lens,
+-                kv_indptr,
+-                None,
+-                kv_indices,
+-                self.req_to_token.stride(0),
+-            )
++            if self.ring_cfg.enabled:
++                # [Windowed-MTP ring] windowed + ring draft-extend read into the
++                # persistent graph buffers. seq_lens here includes the D tree
++                # tokens, so keep_cap = slots_per_req (S+W+D).
++                from sglang.srt.speculative.ring_draft import (
++                    fill_ring_windowed_kv_indices,
++                )
++
++                fill_ring_windowed_kv_indices(
++                    req_pool_indices,
++                    seq_lens,
++                    self.ring_cfg,
++                    self.ring_cfg.slots_per_req,
++                    kv_indptr,
++                    kv_indices,
++                )
++            else:
++                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
++                create_flashinfer_kv_indices_triton[(bs,)](
++                    self.req_to_token,
++                    req_pool_indices,
++                    seq_lens,
++                    kv_indptr,
++                    None,
++                    kv_indices,
++                    self.req_to_token.stride(0),
++                )
+             custom_mask = None
+             mask_indptr = None
+             max_extend_len = num_tokens_per_bs
+@@ -855,17 +876,32 @@
+                 device=self.device,
+             )
+             kv_indptr = self.kv_indptr[: bs + 1]
+-            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+             kv_indices = self.cuda_graph_kv_indices
+-            create_flashinfer_kv_indices_triton[(bs,)](
+-                self.req_to_token,
+-                req_pool_indices,
+-                seq_lens,
+-                kv_indptr,
+-                None,
+-                kv_indices,
+-                self.req_to_token.stride(0),
+-            )
++            if self.ring_cfg.enabled:
++                # [Windowed-MTP ring] windowed + ring draft-extend read (graph replay).
++                from sglang.srt.speculative.ring_draft import (
++                    fill_ring_windowed_kv_indices,
++                )
++
++                fill_ring_windowed_kv_indices(
++                    req_pool_indices,
++                    seq_lens,
++                    self.ring_cfg,
++                    self.ring_cfg.slots_per_req,
++                    kv_indptr,
++                    kv_indices,
++                )
++            else:
++                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
++                create_flashinfer_kv_indices_triton[(bs,)](
++                    self.req_to_token,
++                    req_pool_indices,
++                    seq_lens,
++                    kv_indptr,
++                    None,
++                    kv_indices,
++                    self.req_to_token.stride(0),
++                )
+         else:
+             raise ValueError(
+                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
+@@ -1205,6 +1241,15 @@
+             kv_indptr = self.forward_metadata.kv_indptr
+             kv_indices = self.forward_metadata.kv_indices
+ 
++        # [Windowed-MTP] DRAFT attention-mass probe (RK_ATTN_MASS=1; eager, native/full
++        # kv_indices). No-op otherwise. See speculative/attn_mass.py.
++        from sglang.srt.speculative import attn_mass as _attn_mass
++
++        if _attn_mass.ENABLED:
++            _attn_mass.maybe_record_decode(
++                q, layer, forward_batch, kv_indptr, kv_indices
++            )
++
+         if layer.k_scale is not None and layer.v_scale is not None:
+             k_descale = layer.k_scale_float
+             v_descale = layer.v_scale_float
+@@ -1285,6 +1330,20 @@
+         # Cached variables for generate_draft_decode_kv_indices
+         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+         self.page_size = model_runner.server_args.page_size
++        # [Windowed-MTP ring] draft KV ring-buffer params (0 => ring off, gather as usual)
++        from sglang.srt.speculative.ring_draft import resolve_ring_config
++
++        _ring = resolve_ring_config(
++            model_runner.server_args.speculative_num_draft_tokens or 0
++        )
++        if _ring.enabled:
++            self.ring_slots_per_req = _ring.slots_per_req
++            self.ring_sink = _ring.sink
++            self.ring_modulus = _ring.modulus
++        else:
++            self.ring_slots_per_req = 0
++            self.ring_sink = 0
++            self.ring_modulus = 0
+ 
+     def common_template(
+         self,
+@@ -1315,6 +1374,11 @@
+             next_power_of_2(self.speculative_num_steps),
+             next_power_of_2(bs),
+             self.page_size,
++            get_int_env_var("RK_MTP_WINDOW", 0),  # [Windowed-MTP] draft KV window (0=off)
++            get_int_env_var("RK_MTP_SINK", 0),  # [Windowed-MTP] StreamingLLM sink tokens (0=window-only)
++            self.ring_slots_per_req,  # [Windowed-MTP ring] 0 => gather (ring off)
++            self.ring_sink,
++            self.ring_modulus,
+         )
+ 
+         if call_fn is None:
+--- a/srt/managers/scheduler.py
++++ b/srt/managers/scheduler.py
+@@ -29,6 +29,23 @@
+ 
+ suppress_noisy_warnings()
+ 
++# ---- RK scheduler debug (env-gated, change-throttled) ---------------------
++# Enable with RK_SCHEDDBG=1. Prints only when the message for a given tag
++# changes, so a long steady-state decode phase yields one line per transition
++# instead of millions. Used to trace why a queued prefill req is not admitted
++# (i.e. why the scheduler flips to decode with reqs still waiting).
++_RK_SCHEDDBG = os.environ.get("RK_SCHEDDBG", "0") not in ("", "0")
++_rk_dbg_last: Dict[str, str] = {}
++
++
++def _rk_dbg(tag: str, msg: str) -> None:
++    if not _RK_SCHEDDBG:
++        return
++    if _rk_dbg_last.get(tag) == msg:
++        return
++    _rk_dbg_last[tag] = msg
++    print(f"RK_SCHEDDBG {tag}: {msg}", flush=True)
++
+ import psutil
+ import setproctitle
+ import torch
+@@ -2619,8 +2636,17 @@
+         return ret
+ 
+     def get_num_allocatable_reqs(self, running_bs):
+-        res = get_global_server_args().pp_max_micro_batch_size - running_bs
+-        res = min(res, self.req_to_token_pool.available_size())
++        pp_cap = get_global_server_args().pp_max_micro_batch_size
++        req_pool_avail = self.req_to_token_pool.available_size()
++        res = pp_cap - running_bs
++        res = min(res, req_pool_avail)
++        _rk_dbg(
++            "ALLOC",
++            f"pp_max_micro_batch_size={pp_cap} running_bs={running_bs} "
++            f"req_to_token_pool.available_size={req_pool_avail} "
++            f"max_running_requests={getattr(self, 'max_running_requests', None)} "
++            f"-> allocatable={res}",
++        )
+         return res
+ 
+     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+@@ -2660,6 +2686,12 @@
+         if (
+             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+         ) and self.chunked_req is None:
++            _rk_dbg(
++                "PREFILL_RET",
++                f"reason=full_or_empty batch_is_full={self.running_batch.batch_is_full} "
++                f"waiting_queue={len(self.waiting_queue)} "
++                f"running_bs={len(self.running_batch.reqs)} chunked=None",
++            )
+             return None
+ 
+         running_bs = len(self.running_batch.reqs)
+@@ -2674,6 +2706,12 @@
+             and self.chunked_req is None
+             and not self.enable_priority_preemption
+         ):
++            _rk_dbg(
++                "PREFILL_RET",
++                f"reason=allocatable<=0 running_bs={running_bs} "
++                f"waiting_queue={len(self.waiting_queue)} "
++                f"kv_pool_avail={self.token_to_kv_pool_allocator.available_size()}",
++            )
+             self.running_batch.batch_is_full = True
+             return None
+ 
+@@ -2737,8 +2775,30 @@
+                 continue
+ 
+             running_bs = len(self.running_batch.reqs)
+-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
++            _rk_num_alloc = self.get_num_allocatable_reqs(running_bs)
++            _rk_crl = len(adder.can_run_list)
++            _rk_dbg(
++                "FULLCHECK",
++                f"running_bs={running_bs} can_run_list={_rk_crl} "
++                f"num_allocatable={_rk_num_alloc} "
++                f"pp_max_micro_batch_size={get_global_server_args().pp_max_micro_batch_size} "
++                f"req_pool_avail={self.req_to_token_pool.available_size()} "
++                f"max_running_requests={getattr(self, 'max_running_requests', None)} "
++                f"chunked_req={self.chunked_req is not None} "
++                f"waiting_queue={len(self.waiting_queue)} "
++                f"will_set_full={_rk_crl >= _rk_num_alloc}",
++            )
++            if _rk_crl >= _rk_num_alloc:
+                 self.running_batch.batch_is_full = True
++                _rk_dbg(
++                    "FULLSET",
++                    f"batch_is_full=True: can_run_list={_rk_crl} >= "
++                    f"num_allocatable={_rk_num_alloc} "
++                    f"(running_bs={running_bs}, "
++                    f"pp_cap-running_bs={get_global_server_args().pp_max_micro_batch_size - running_bs}, "
++                    f"req_pool_avail={self.req_to_token_pool.available_size()}, "
++                    f"rid={getattr(req, 'rid', None)})",
++                )
+             if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                 # In prefill mode, prealloc queue and transfer queue can also take memory,
+                 # so we need to check if the available size for the actual available size.
+@@ -2773,6 +2833,17 @@
+                 running_loras.add(req.lora_id)
+ 
+             if res != AddReqResult.CONTINUE:
++                _rk_dbg(
++                    "ADD_REQ",
++                    f"res={res} can_run_list={len(adder.can_run_list)} "
++                    f"running_bs={len(self.running_batch.reqs)} "
++                    f"waiting_queue={len(self.waiting_queue)} "
++                    f"req_extend_len={getattr(req, 'extend_input_len', None)} "
++                    f"kv_pool_avail={self.token_to_kv_pool_allocator.available_size()} "
++                    f"req_pool_avail={self.req_to_token_pool.available_size()} "
++                    f"rem_total_tokens={getattr(adder, 'rem_total_tokens', None)} "
++                    f"new_token_ratio={self.new_token_ratio}",
++                )
+                 if res == AddReqResult.NO_TOKEN:
+                     if self.enable_hierarchical_cache:
+                         # Set batch_is_full after making sure there are requests that can be served
+--- a/srt/mem_cache/memory_pool.py
++++ b/srt/mem_cache/memory_pool.py
+@@ -27,10 +27,24 @@
+ import abc
+ import dataclasses
+ import logging
++import os as _os
+ from contextlib import contextmanager, nullcontext
+ from dataclasses import dataclass, fields
+ from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+ 
++# ---- RK memory-pool debug (env-gated, change-throttled) -------------------
++_RK_MEMDBG = _os.environ.get("RK_SCHEDDBG", "0") not in ("", "0")
++_rk_mem_last: dict = {}
++
++
++def _rk_mem_dbg(tag: str, msg: str) -> None:
++    if not _RK_MEMDBG:
++        return
++    if _rk_mem_last.get(tag) == msg:
++        return
++    _rk_mem_last[tag] = msg
++    print(f"RK_SCHEDDBG {tag}: {msg}", flush=True)
++
+ import numpy as np
+ import torch
+ import triton
+@@ -150,6 +164,11 @@
+                 (self._alloc_size, max_context_len), dtype=torch.int32, device=device
+             )
+         self.free_slots = list(range(1, self._alloc_size))
++        _rk_mem_dbg(
++            "REQPOOL_INIT",
++            f"ReqToTokenPool size={self.size} alloc_size={self._alloc_size} "
++            f"initial_free_slots={len(self.free_slots)} max_context_len={max_context_len}",
++        )
+ 
+     def write(self, indices, values):
+         self.req_to_token[indices] = values
+@@ -173,9 +192,19 @@
+ 
+         need_size = len(reqs) - len(reusing)
+         if need_size > len(self.free_slots):
++            _rk_mem_dbg(
++                "REQPOOL_ALLOC_FAIL",
++                f"need_size={need_size} free_slots={len(self.free_slots)} "
++                f"nreqs={len(reqs)} reusing={len(reusing)} -> return None",
++            )
+             return None
+         select_index = self.free_slots[:need_size]
+         self.free_slots = self.free_slots[need_size:]
++        _rk_mem_dbg(
++            "REQPOOL_ALLOC",
++            f"allocated need_size={need_size} nreqs={len(reqs)} reusing={len(reusing)} "
++            f"free_after={len(self.free_slots)}",
++        )
+         offset = 0
+         for r in reqs:
+             if r.req_pool_idx is None:
+--- a/srt/model_executor/model_runner_kv_cache_mixin.py
++++ b/srt/model_executor/model_runner_kv_cache_mixin.py
+@@ -586,9 +586,39 @@
+                         "kv_lora_rank": self.model_config.kv_lora_rank,
+                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+                     }
++                # [Windowed-MTP] Windowed-MTP draft KV ring buffer: shrink the *draft*
++                # HybridLinearKVPool from a full-length pool to a compact per-request
++                # ring of (sink + W + draft_tokens) slots. Draft-only + gated; the
++                # draft KV indices/writes are remapped by ring_slot(...) elsewhere.
++                _hybrid_pool_size = self.max_total_num_tokens
++                if self.is_draft_worker:
++                    from sglang.srt.speculative.ring_draft import (
++                        assert_ring_supported,
++                        resolve_ring_config,
++                    )
++
++                    _ring_cfg = resolve_ring_config(
++                        self.server_args.speculative_num_draft_tokens or 0
++                    )
++                    assert_ring_supported(self.server_args, _ring_cfg)
++                    if _ring_cfg.enabled:
++                        _max_num_reqs = self.req_to_token_pool.size
++                        _ring_size = _ring_cfg.pool_size(_max_num_reqs)
++                        logger.info(
++                            "[Windowed-MTP ring] draft KV pool: %d -> %d slots "
++                            "(sink=%d W=%d D=%d, %d reqs x %d slots/req)",
++                            _hybrid_pool_size,
++                            _ring_size,
++                            _ring_cfg.sink,
++                            _ring_cfg.window,
++                            _ring_cfg.draft_tokens,
++                            _max_num_reqs,
++                            _ring_cfg.slots_per_req,
++                        )
++                        _hybrid_pool_size = _ring_size
+                 self.token_to_kv_pool = HybridLinearKVPool(
+                     page_size=self.page_size,
+-                    size=self.max_total_num_tokens,
++                    size=_hybrid_pool_size,
+                     dtype=self.kv_cache_dtype,
+                     head_num=self.model_config.get_num_kv_heads(
+                         get_attention_tp_size()
+--- a/srt/models/qwen3_5_mtp.py
++++ b/srt/models/qwen3_5_mtp.py
+@@ -87,6 +87,20 @@
+         self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
+         config.num_hidden_layers = 1
+         config.full_attention_interval = 1
++        # [Windowed-MTP] RK_MTP_MOE_TOPK overrides the MTP layer's routed
++        # expert count (num_experts_per_tok) WITHOUT touching the target model: the
++        # target was already constructed (its MoE captured top_k at init), so mutating
++        # the shared config here only affects the single MTP layer built just below.
++        # Sweep 1..num_experts to probe AL-vs-draft-FFN-cost (fewer experts = cheaper
++        # draft; does AL hold? does adding experts buy AL back into net tok/s?).
++        import os as _os
++        _mtp_topk = _os.environ.get("RK_MTP_MOE_TOPK", "")
++        if _mtp_topk:
++            logger.warning(
++                f"[RK] MTP routed experts (num_experts_per_tok) "
++                f"{config.num_experts_per_tok} -> {int(_mtp_topk)} (target unchanged)"
++            )
++            config.num_experts_per_tok = int(_mtp_topk)
+         self.model = Qwen3_5ForCausalLM(
+             config,
+             quant_config,
+--- a/srt/models/qwen3_5.py
++++ b/srt/models/qwen3_5.py
+@@ -741,6 +741,12 @@
+             prefix=add_prefix("o_proj", prefix),
+         )
+ 
++        # [Windowed-MTP] The MTP/NEXTN draft attention is windowed NOT via
++        # layer.sliding_window_size (that routes to SGLang's SWA grouped-decode
++        # kernel, which is buggy for the spec-draft path on B200), but by
++        # truncating the draft's kv_indices to the last RK_MTP_WINDOW tokens in the
++        # triton backend's draft-decode metadata. So the layer stays "full" here
++        # and reuses the working decode kernel over fewer KV positions.
+         self.attn = RadixAttention(
+             self.num_heads,
+             self.head_dim,
+--- a/srt/speculative/eagle_info_v2.py
++++ b/srt/speculative/eagle_info_v2.py
+@@ -66,6 +66,9 @@
+     pool_len: tl.constexpr,
+     topk: tl.constexpr,
+     speculative_num_steps: tl.constexpr,
++    ring_slots_per_req: tl.constexpr = 0,
++    ring_sink: tl.constexpr = 0,
++    ring_modulus: tl.constexpr = 0,
+ ):
+     BLOCK_SIZE: tl.constexpr = 128
+     pid = tl.program_id(axis=0)
+@@ -75,12 +78,21 @@
+ 
+     # Copy from req_to_token to out_cache_loc
+     kv_start = tl.load(seq_lens + pid)
+-    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
++    req_idx = tl.load(req_pool_indices + pid)
++    token_pool = req_to_token + req_idx * pool_len
++    ring_base = req_idx * ring_slots_per_req
+     num_loop = tl.cdiv(copy_len, BLOCK_SIZE)
+     for i in range(num_loop):
+         copy_offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+         mask = copy_offset < copy_len
+-        data = tl.load(token_pool + kv_start + copy_offset, mask=mask)
++        if ring_modulus > 0:
++            # [Windowed-MTP ring] tree token position = seq_len + copy_offset; write to the
++            # matching ring slot (must equal the decode-read mapping in spec_utils).
++            pos = kv_start + copy_offset
++            recent_slot = ring_sink + (pos - ring_sink) % ring_modulus
++            data = ring_base + tl.where(pos < ring_sink, pos, recent_slot)
++        else:
++            data = tl.load(token_pool + kv_start + copy_offset, mask=mask)
+         tl.store(out_cache_ptr + copy_offset, data, mask=mask)
+ 
+ 
+@@ -193,6 +205,11 @@
+                 device=batch.input_ids.device,
+             )
+             # FIXME(lsyin): align with the default code path
++            from sglang.srt.speculative.ring_draft import resolve_ring_config
++
++            _ring = resolve_ring_config(
++                draft_model_runner.server_args.speculative_num_draft_tokens or 0
++            )
+             assign_draft_cache_locs_page_size_1[(bs,)](
+                 batch.req_pool_indices,
+                 req_to_token_pool.req_to_token,
+@@ -201,6 +218,9 @@
+                 req_to_token_pool.req_to_token.shape[1],
+                 topk,
+                 num_steps,
++                _ring.slots_per_req if _ring.enabled else 0,
++                _ring.sink if _ring.enabled else 0,
++                _ring.modulus if _ring.enabled else 0,
+             )
+ 
+         # Get a forward batch
+@@ -247,10 +267,47 @@
+             if batch.forward_mode.is_idle()
+             else ForwardMode.DRAFT_EXTEND_V2
+         )
++
++        # [Windowed-MTP ring] Remap the draft-extend WRITE to compact ring slots. The
++        # extend writes KV for the D committed positions [prefix_len, prefix_len+D)
++        # of each req; out_cache_loc is not otherwise set on this path.
++        from sglang.srt.speculative.ring_draft import (
++            build_ring_windowed_kv_indices,
++            resolve_ring_config,
++            ring_extend_out_cache_loc,
++        )
++
++        _ring = resolve_ring_config(num_draft_tokens)
++        if _ring.enabled and not batch.forward_mode.is_idle():
++            _prefix_lens = batch.seq_lens - num_draft_tokens
++            batch.out_cache_loc = ring_extend_out_cache_loc(
++                batch.req_pool_indices, _prefix_lens, num_draft_tokens, _ring
++            )
++
+         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
+         if not batch.forward_mode.is_idle() and not can_cuda_graph:
+             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
++            # [Windowed-MTP ring] Override the prefix READ with windowed + ring
++            # indices (the compact pool only holds sink+W of the prefix). Eager
++            # only -- cuda graph is disallowed under RK_DRAFT_RING (see
++            # assert_ring_supported).
++            if _ring.enabled:
++                _prefix_lens = batch.seq_lens - num_draft_tokens
++                _kv_indices, _kv_indptr = build_ring_windowed_kv_indices(
++                    batch.req_pool_indices,
++                    _prefix_lens,
++                    _ring,
++                    forward_batch.input_ids.device,
++                )
++                # On hybrid (GDN/Mamba2) models the draft attn backend is a
++                # HybridLinearAttnBackend that delegates attention to
++                # `full_attn_backend`; that sub-backend holds forward_metadata.
++                _be = draft_model_runner.attn_backend
++                _be = getattr(_be, "full_attn_backend", _be)
++                _fm = _be.forward_metadata
++                _fm.kv_indices = _kv_indices
++                _fm.kv_indptr = _kv_indptr
+         return forward_batch
+ 
+ 
+--- a/srt/speculative/eagle_worker_v2.py
++++ b/srt/speculative/eagle_worker_v2.py
+@@ -553,7 +553,59 @@
+         forward_batch.return_logprob = False
+         if mm_input_embeds is not None:
+             forward_batch.mm_input_embeds = mm_input_embeds
+-        logits_output = self.draft_runner.forward(forward_batch).logits_output
++
++        # [Windowed-MTP ring] Remap prefill to the compact ring pool. Two parts:
++        #  (1) WRITE: every prefill position is written (wrapping in the recent
++        #      band); value-correct because draft K/V are pure per-position input
++        #      projections. Only the sink+W slots surviving the wrap are read later.
++        #  (2) READ: under chunked prefill (1M ctx), chunk>=2 has a nonzero
++        #      extend_prefix_lens, and the draft prefill would read that prefix via
++        #      req_to_token (target-space slots) -> OOB in the compact draft pool.
++        #      So window+ring the prefix read exactly like the draft-extend path.
++        _ring = None
++        if not batch.forward_mode.is_idle():
++            from sglang.srt.speculative.ring_draft import (
++                build_ring_windowed_kv_indices,
++                resolve_ring_config,
++                ring_out_cache_loc_from_positions,
++            )
++
++            _ring = resolve_ring_config(self.speculative_num_draft_tokens)
++            if _ring.enabled:
++                _reqs_per_token = torch.repeat_interleave(
++                    batch.req_pool_indices,
++                    torch.tensor(
++                        batch.extend_seq_lens,
++                        device=forward_batch.positions.device,
++                        dtype=torch.int64,
++                    ),
++                )
++                forward_batch.out_cache_loc = ring_out_cache_loc_from_positions(
++                    _reqs_per_token, forward_batch.positions, _ring
++                )
++
++        if _ring is not None and _ring.enabled and not batch.forward_mode.is_idle():
++            # Manual metadata init + windowed+ring prefix read override, then
++            # forward with skip_attn_backend_init (prefill is eager: not captured).
++            self.draft_runner.attn_backend.init_forward_metadata(forward_batch)
++            _prefix_lens = forward_batch.extend_prefix_lens
++            if _prefix_lens is not None and int(_prefix_lens.max()) > 0:
++                _kv_indices, _kv_indptr = build_ring_windowed_kv_indices(
++                    forward_batch.req_pool_indices,
++                    _prefix_lens,
++                    _ring,
++                    forward_batch.input_ids.device,
++                )
++                _be = self.draft_runner.attn_backend
++                _be = getattr(_be, "full_attn_backend", _be)
++                _fm = _be.forward_metadata
++                _fm.kv_indices = _kv_indices
++                _fm.kv_indptr = _kv_indptr
++            logits_output = self.draft_runner.forward(
++                forward_batch, skip_attn_backend_init=True
++            ).logits_output
++        else:
++            logits_output = self.draft_runner.forward(forward_batch).logits_output
+         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
+ 
+         # Update spec_info for the next draft step
+@@ -753,9 +805,21 @@
+                 else CaptureHiddenMode.FULL
+             )
+             model_worker_batch.capture_hidden_mode = target_capture_mode
++            # [Windowed-MTP] env-gated prefill-phase timing (RK_TIME_DRAFT_PREFILL=1):
++            # size the *exposed* draft MTP prefill cost vs the target prefill, per
++            # chunk. Forces a sync (measurement only), so keep it off for perf runs.
++            import os as _os
++
++            _time_pf = _os.environ.get("RK_TIME_DRAFT_PREFILL") == "1"
++            if _time_pf:
++                torch.cuda.synchronize()
++                _t0 = time.perf_counter()
+             batch_output = self.target_worker.forward_batch_generation(
+                 model_worker_batch
+             )
++            if _time_pf:
++                torch.cuda.synchronize()
++                _t1 = time.perf_counter()
+ 
+             # Draft prefill
+             draft_capture_mode = (
+@@ -779,6 +843,20 @@
+                         batch_output.logits_output.mm_input_embeds,
+                     )
+                 )
++                if _time_pf:
++                    torch.cuda.synchronize()
++                    _t2 = time.perf_counter()
++                    _lens = list(getattr(model_worker_batch, "extend_seq_lens", []) or [])
++                    logger.info(
++                        "[RK-prefill-timing] target_ms=%.2f draft_ms=%.2f "
++                        "draft_frac=%.3f extend_lens=%s"
++                        % (
++                            (_t1 - _t0) * 1e3,
++                            (_t2 - _t1) * 1e3,
++                            (_t2 - _t1) / max(_t2 - _t0, 1e-9),
++                            _lens,
++                        )
++                    )
+                 return batch_output
+         else:
+             if model_worker_batch.spec_info is None:
+--- a/srt/speculative/spec_utils.py
++++ b/srt/speculative/spec_utils.py
+@@ -270,7 +270,29 @@
+     iter_upper: tl.constexpr,
+     num_tokens_upper: tl.constexpr,
+     page_size: tl.constexpr,
++    window_size: tl.constexpr = 0,
++    sink_size: tl.constexpr = 0,
++    ring_slots_per_req: tl.constexpr = 0,
++    ring_sink: tl.constexpr = 0,
++    ring_modulus: tl.constexpr = 0,
+ ):
++    # [Windowed-MTP ring] ring_modulus > 0 => the draft KV pool is a compact per-request
++    # ring of `ring_slots_per_req` slots; instead of gathering the shared allocator slot
++    # from `req_to_token`, we emit the ring physical slot for each token *position*:
++    #   ring_slot(r, p) = r*ring_slots_per_req + (p < ring_sink ? p
++    #                                             : ring_sink + (p - ring_sink) % ring_modulus)
++    # This must stay in lock-step with the draft KV write locations (out_cache_loc),
++    # which use the identical mapping. Requires window_size > 0 (only the last
++    # `window_size` + tree positions are ever read, so no evicted slot is touched).
++    # [Windowed-MTP] window_size > 0 sparsifies the SPEC-DRAFT decode KV
++    # (the MTP/NEXTN draft head) to a StreamingLLM layout: keep the first
++    # `sink_size` tokens (attention sink) + the most-recent `window_size` tokens.
++    # sink_size == 0 => pure recent window. It is applied here, in the canonical
++    # draft-decode index builder, so it is (a) backend-agnostic (flashinfer/
++    # triton/aiter all read the resulting kv_indptr/kv_indices), and (b) cuda-
++    # graph safe (fixed launch grid, no host sync, lengths carried in kv_indptr
++    # exactly like the variable-seqlen path the graph already replays).
++    # window_size == 0 reproduces the original full-KV behavior byte-for-byte.
+     BLOCK_SIZE: tl.constexpr = 128
+     iters = tl.program_id(axis=0)
+     bid = tl.program_id(axis=1)
+@@ -287,27 +309,62 @@
+     load_offset = tl.arange(0, bs_upper)
+     seq_lens = tl.load(paged_kernel_lens + load_offset, mask=load_offset < bid, other=0)
+     seq_len = tl.load(paged_kernel_lens + bid)
++    # Window the prefix length used for *layout* (cumulative offsets) and the
++    # number of base tokens copied. Extend (newly-cached draft) tokens are kept.
++    # window+sink: keep first `sink_size` + last `window_size` -> total kept =
++    # min(seq_len, window_size+sink_size); `s_eff` sink tokens read from pool[0:s_eff],
++    # the rest read from the recent window starting at `recent_start`.
++    if window_size > 0:
++        cap = window_size + sink_size
++        seq_lens = tl.minimum(seq_lens, cap)
++        seq_len_w = tl.minimum(seq_len, cap)  # total kept base tokens (sink+recent)
++        s_eff = tl.minimum(sink_size, seq_len)
++        recent_start = seq_len - (seq_len_w - s_eff)  # start of recent window in pool
++    else:
++        seq_len_w = seq_len
++        s_eff = 0
++        recent_start = 0
+     cum_seq_len = tl.sum(seq_lens)
+ 
+     # Update kv_indices
+-    kv_offset = cum_seq_len * topk + bid * iters * topk + topk_id * (seq_len + iters)
++    kv_offset = cum_seq_len * topk + bid * iters * topk + topk_id * (seq_len_w + iters)
+     kv_ptr = kv_indices + kv_offset
+-    token_pool_ptr = req_to_token + tl.load(req_pool_indices + bid) * pool_len
++    req_idx = tl.load(req_pool_indices + bid)
++    token_pool_ptr = req_to_token + req_idx * pool_len
++    ring_base = req_idx * ring_slots_per_req
+ 
+     kv_offset = tl.arange(0, BLOCK_SIZE)
+-    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
++    num_loop = tl.cdiv(seq_len_w, BLOCK_SIZE)
+     for _ in range(num_loop):
+-        mask = kv_offset < seq_len
+-        data = tl.load(token_pool_ptr + kv_offset, mask=mask)
++        mask = kv_offset < seq_len_w
++        # gather: first s_eff outputs map to pool[0:s_eff] (sink), the rest to the
++        # recent window pool[recent_start:]. s_eff==0 => contiguous recent slice.
++        src = tl.where(kv_offset < s_eff, kv_offset, recent_start + kv_offset - s_eff)
++        if ring_modulus > 0:
++            # emit ring physical slot for token *position* `src` (no gather)
++            recent_slot = ring_sink + (src - ring_sink) % ring_modulus
++            data = ring_base + tl.where(src < ring_sink, src, recent_slot)
++        else:
++            data = tl.load(token_pool_ptr + src, mask=mask)
+         tl.store(kv_ptr + kv_offset, data, mask=mask)
+         kv_offset += BLOCK_SIZE
+ 
+     extend_offset = tl.arange(0, iter_upper)
+     if page_size == 1 or topk == 1:
+-        extend_data = tl.load(
+-            token_pool_ptr + seq_len + topk_id * num_steps + tl.arange(0, iter_upper),
+-            mask=extend_offset < iters,
+-        )
++        if ring_modulus > 0:
++            # tree tokens live at positions seq_len + topk_id*num_steps + i
++            epos = seq_len + topk_id * num_steps + tl.arange(0, iter_upper)
++            extend_data = (
++                ring_base + ring_sink + (epos - ring_sink) % ring_modulus
++            )
++        else:
++            extend_data = tl.load(
++                token_pool_ptr
++                + seq_len
++                + topk_id * num_steps
++                + tl.arange(0, iter_upper),
++                mask=extend_offset < iters,
++            )
+     else:
+         prefix_len = seq_len
+         last_page_len = prefix_len % page_size
+@@ -323,7 +380,7 @@
+             mask=extend_offset < iters,
+         )
+ 
+-    tl.store(kv_ptr + seq_len + extend_offset, extend_data, mask=extend_offset < iters)
++    tl.store(kv_ptr + seq_len_w + extend_offset, extend_data, mask=extend_offset < iters)
+ 
+     # Update kv_indptr
+     bs_offset = tl.arange(0, num_tokens_upper)
+@@ -332,6 +389,10 @@
+     if zid == 0:
+         zid = num_seqs * topk
+     positions = tl.load(positions + bs_offset, mask=bs_offset < zid, other=0)
++    # Match the windowed layout: each prior slot contributes min(len, W+sink) base
++    # tokens to the cumulative kv_indptr (extend tokens unchanged).
++    if window_size > 0:
++        positions = tl.minimum(positions, window_size + sink_size)
+     base = tl.sum(positions)
+     tl.store(kv_indptr + zid, base + zid * iters)
+ 

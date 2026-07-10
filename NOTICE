@@ -1,0 +1,62 @@
+Windowed-MTP — B200 reproduction package
+Copyright 2026 Windowed-MTP Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+------------------------------------------------------------------------------
+Third-party components, datasets, and models
+------------------------------------------------------------------------------
+
+This package builds on, patches, or downloads the following third-party works.
+Each remains under its own license; the terms below are informational and do
+not modify this package's Apache-2.0 license.
+
+SOFTWARE
+--------
+
+* SGLang (https://github.com/sgl-project/sglang) — Apache-2.0.
+  patch/windowed_mtp.patch and the drop-in files in patch/ are DERIVATIVE WORKS
+  of SGLang 26.06. Modified files carry inline "[Windowed-MTP]" notices marking
+  our changes, per Apache-2.0 section 4(b).
+  Copyright 2023-2024 SGLang Team.
+
+* FlashInfer (https://github.com/flashinfer-ai/flashinfer) — Apache-2.0.
+  Used as the target/native-draft attention backend via the SGLang container.
+
+* Triton (https://github.com/triton-lang/triton) — MIT.
+  The windowed draft-extend/decode kernels are tuned Triton kernels.
+
+* Hugging Face Transformers / huggingface_hub — Apache-2.0.
+  Used on the host for model download and tokenization only.
+
+* NVIDIA SGLang container image (nvcr.io/nvidia/sglang:26.06-py3).
+  Pulled at setup time (not redistributed here); governed by the NVIDIA Deep
+  Learning Container / NGC license terms.
+
+METHODS / TECHNIQUES (cited, no code vendored)
+----------------------------------------------
+
+* StreamingLLM (Xiao et al., 2024) — attention sink + sliding window.
+* YaRN (Peng et al., 2023) and positional interpolation (Chen et al., 2023) —
+  context-length extension applied to the Qwen checkpoints.
+* RULER (Hsieh et al., 2024) — long-context task families. src/gen_ruler.py is
+  an independent, dependency-free RE-IMPLEMENTATION of the RULER task templates;
+  it embeds no RULER data and carries no dataset license. Inputs are synthesized
+  locally from a seeded generator.
+
+DATASETS (used only in the full paper's extended evaluation; NOT bundled here)
+-----------------------------------------------------------------------------
+
+* LongBench-v2 (THU-KEG & Zhipu AI) — data Apache-2.0, code MIT.
+* BABILong (Kuratov et al., 2024) — Apache-2.0; background text from PG-19
+  (Apache-2.0 / public domain) and facts from bAbI (Weston et al., 2016, BSD).
+
+MODELS (downloaded by setup/02_get_models.sh; NOT redistributed here)
+---------------------------------------------------------------------
+
+* RedHatAI/Qwen3.6-35B-A3B-NVFP4        — Apache-2.0 (base: Qwen/Qwen3.6-35B-A3B).
+* nvidia/Qwen3.5-122B-A10B-NVFP4        — Apache-2.0 (base: Qwen3.5-122B).
+* nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+      — NVIDIA Nemotron Open Model License. Commercial use and derivative works
+        permitted; NVIDIA claims no ownership of model outputs. Accept the terms
+        on the Hugging Face model card before download.

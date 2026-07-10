@@ -1,0 +1,19 @@
+# Downloaded / generated artifacts — never commit these.
+hf_cache/
+sglang_patched/
+data/
+results/
+logs/
+*.sqsh
+*.log
+__pycache__/
+*.pyc
+
+# host-side Python venv (setup/00_venv.sh)
+.venv/
+
+# JIT/kernel caches mounted into the container
+.cache/
+
+# local YaRN-prepared model dirs (setup/02_get_models.sh)
+models/

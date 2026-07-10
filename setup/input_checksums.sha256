@@ -1,0 +1,7 @@
+# Reference SHA256 of the headline input corpora (paper's exact bytes).
+# setup/02_get_models.sh builds these with src/gen_ruler.py and verifies them here.
+# The RULER corpora are fully seeded / dependency-free, so they are byte-identical
+# on any Python 3.8+ -- a mismatch means gen_ruler.py was edited (or a very old Python).
+4ff6d96779339a0f61ccccfdf0b8e21580a28d32fd56c9a74555610e699a3d23  data/ruler_qa_1m/niah_multiquery_enum_1150000.jsonl
+9d815b8486e5c0cfc2b7e0b244cbb4256e021f4da2efce0474808619742657b7  data/ruler_qa_1m/fwe_enum_1150000.jsonl
+b9ffd04ceea307eeeb4a1639589a93b657320e874dfade0ca10d1adbd79a4003  data/ruler_qa_1m/cwe_1150000.jsonl
