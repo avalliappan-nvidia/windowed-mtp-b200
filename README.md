@@ -1,6 +1,7 @@
 # Windowed-MTP — B200 reproduction package
 
 [![arXiv](https://img.shields.io/badge/arXiv-2607.21535-b31b1b.svg)](https://arxiv.org/abs/2607.21535)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21522901.svg)](https://doi.org/10.5281/zenodo.21522901)
 
 This artifact reproduces the **core mechanism** of the paper: at 1M-token
 context, replacing the multi-token-prediction (MTP) draft's full-KV attention
@@ -290,7 +291,7 @@ If you use this artifact or its results, please cite the paper (GitHub also rend
   year   = {2026},
   note   = {NVIDIA. Code: https://github.com/avalliappan-nvidia/windowed-mtp-b200},
   url    = {https://arxiv.org/abs/2607.21535},
-  % doi = {10.5281/zenodo.XXXXXXX},             % add after Zenodo release
+  doi    = {10.5281/zenodo.21522901},
 }
 ```
 

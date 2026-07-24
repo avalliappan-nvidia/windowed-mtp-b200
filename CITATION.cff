@@ -8,6 +8,7 @@ authors:
     affiliation: NVIDIA
     email: avalliappan@nvidia.com
 repository-code: "https://github.com/avalliappan-nvidia/windowed-mtp-b200"
+doi: 10.5281/zenodo.21522901   # Zenodo concept DOI (always resolves to the latest version)
 license: Apache-2.0
 version: "1.0.0"
 date-released: "2026-07-23"
@@ -26,5 +27,6 @@ preferred-citation:
       given-names: Alagappan
       affiliation: NVIDIA
   year: 2026
-  # doi: 10.5281/zenodo.XXXXXXX   # fill in after minting the Zenodo DOI
+  # The paper is identified by arXiv; the software's Zenodo concept DOI is the
+  # top-level `doi` above.
   url: https://arxiv.org/abs/2607.21535
